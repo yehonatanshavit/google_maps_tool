@@ -8,8 +8,8 @@ TODO:
     3. add documentation
     4. write unit-tests (?)
     5. create database - synthetic / combinations of many businesses
-
 """
+import warnings
 
 import googlemaps
 import json
@@ -49,88 +49,84 @@ class googlemaps_scraper:
         self.gmaps = googlemaps.Client(key=self.api_key)
 
         # stage 3: create an empty dictionary for scraped data
-        self.raw_data = {}
-        self.businesses_data_keys = ['name', 'place_id', 'url', 'rating', 'reviews', 'business_status',
-                                     'formatted_address']
-        self.business_data = {}
+        self.names_data = {}
+        self.raw_data = []
+        self.businesses_data_keys = ['name', 'place_id', 'url', 'rating', 'business_status', 'formatted_address']
+        self.business_data = []
         self.reviews_data = []
+        self.sample_index = 0
 
-    def __call__(self, places_names: list = []):
-        """
-        This is the full pipeline for scarping reviews from google maps:
-
-            1. the user provides a list of business names
-
-            for each business:
-                1. get raw data - get the business data from google maps using googlemaps API
-                2. get business data - get each business data (in this stage, includes the reviews)
-                3. get reviews that data - separate the reviews data from business data
-
-            Export:
-                create 2 dataframes - one for business data (meta-data about each business) and reviews data. In both
-                cases, the key of each raw pointing to the original business name that the user provided.
-
-        """
+    def __call__(self, places_names: list = [], accumulate: bool = False):
+        # create names places names indexes
         for place_name in places_names:
-            self.get_raw_data(place_name)
+            self.get_raw_data(place_name, accumulate=accumulate)
             self.get_business_data(place_name)
-            self.get_reviews_data(place_name)
 
-    def get_raw_data(self, place_name: str = None):
+    def get_raw_data(self, place_name: str = None, accumulate: bool = False):
         """
         get raw data about the business from scraping
         """
 
-        # stage 1: scrape data and validate it
+        # stage 1: get scraped data, and make that it is OK
         scraped_data = self.gmaps.places(place_name)
-        # Make sure that the results are OK
-        if scraped_data['status'] != "OK":
-            pass
-            return
-        # make sure that there is only a single place scraped
-        if len(scraped_data['results']) != 1:
-            pass
-        # make sure that the scraped business name matches the input name
-        if scraped_data['results'][0]['name'] not in place_name:
-            pass
-
-        # stage 2: get business full data using business's ID
-        place_data = self.gmaps.place(scraped_data['results'][0]['place_id'])
-        # make sure place data is valid
-        if place_data['status'] != 'OK':
-            pass
+        if (scraped_data['status'] != "OK") | (len(scraped_data['results']) == 0):
+            warnings.warn(f"The business name '{place_name}' can not be extracted from google maps")
             return
 
-        # append to raw data
-        self.raw_data[place_name] = place_data['result']
+        # if there is more than a single results, and the user does not wishes to accumulate the results, get only the
+        # first results
+        if (not accumulate) & (len(scraped_data['results']) > 1):
+            warnings.warn(f"The business name '{place_name} has {len(scraped_data['results'])} results."
+                          f" Since 'accumulate==False', using only the first results")
+            scraped_data['results'] = [scraped_data['results'][0]]
+
+        # iterate over all results
+        for result in scraped_data['results']:
+
+            # make sure that the scraped business name matches the input name
+            if result['name'].lower() not in place_name.lower():
+                warnings.warn(f"The required business name '{place_name}',"
+                              f" does not match the scraped business name '{result['name']}'")
+
+            # stage 2: get business full data using business's ID
+            place_data = self.gmaps.place(result['place_id'])
+
+            # make sure place data is valid
+            if place_data['status'] != 'OK':
+                warnings.warn(f"Something is wrong with extracting data from the place '{place_name}'")
+                continue
+
+            # append to raw data
+            self.raw_data.append({**{'name_key': place_name}, **place_data['result']})
 
     def get_business_data(self, place_name: str = None):
         """
         get the business data as mentioned in the required keys
         """
-        if place_name in place_name in self.raw_data.keys():
-            self.business_data[place_name] = {k: self.raw_data[place_name][k] for k in self.businesses_data_keys}
-        else:
-            pass
 
-    def get_reviews_data(self, place_name: str = None):
-
-        # make sure that the business in raw data
-        if place_name in place_name in self.business_data.keys():
-            # extract reviews
-            self.reviews_data.extend([{**{'key': place_name}, **r} for r in self.business_data[place_name]['reviews']])
-            # delete reviews data from business so it does not appear twice
-            del self.business_data[place_name]['reviews']
+        # iterate over all samples in raw data
+        for d in self.raw_data:
+            # continue only if the sample is related to current place name
+            if d['name_key'] == place_name:
+                # increase sample index by 1 (similar to 'primary key' in SQL)
+                self.sample_index += 1
+                # extract business 'meta' data
+                self.business_data.append({**{'business_key': self.sample_index, 'name_key': place_name},
+                                           **{k: d[k] for k in self.businesses_data_keys}})
+                # extract reviews data
+                self.reviews_data.extend([{**{'business_key': self.sample_index, 'name_key': place_name},
+                                           **r} for r in d['reviews']])
 
     def export_data(self):
-        return pd.DataFrame(self.business_data).T, pd.DataFrame(self.reviews_data).set_index('key')
+        pd.DataFrame(self.business_data).to_csv('business_data.csv')
+        pd.DataFrame(self.reviews_data).to_csv('reviews_data.csv')
 
 
 def use_googlemaps_scraper():
-    places = ['Anita', 'Shuffle Bar, Tel-Aviv', 'shafel', 'gnjowet532']
+    places = ['Subway, New-York', "McDonald's, New-York", "KFC, New-York", "Wendy's, New-York"]
     g_scraper = googlemaps_scraper()
-    g_scraper(places)
-    business_df, reviews_df = g_scraper.export_data()
+    g_scraper(places, accumulate=True)
+    g_scraper.export_data()
 
 
 if __name__ == "__main__":
