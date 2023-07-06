@@ -15,6 +15,8 @@ import googlemaps
 import json
 import os
 import pandas as pd
+from datetime import datetime, timedelta
+import matplotlib.pyplot as plt
 
 
 def read_json_file(file_path):
@@ -31,6 +33,9 @@ class googlemaps_scraper:
          read here how to get it https://developers.google.com/maps/documentation/javascript/get-api-key
         2. google limits the amount of reviews that you can scrape from a business to 5
     """
+    # according to google's documentations, the key 'time' in reviews is the amount of seconds since 1/1/1970 midnight.
+    # Take a look here: https://developers.google.com/maps/documentation/places/web-service/details#PlaceReview
+    start_date = datetime(1970, 1, 1, 0, 0, 0)
 
     def __init__(self, api_key: str = None):
 
@@ -49,85 +54,160 @@ class googlemaps_scraper:
         self.gmaps = googlemaps.Client(key=self.api_key)
 
         # stage 3: create an empty dictionary for scraped data
-        self.names_data = {}
-        self.raw_data = []
-        self.businesses_data_keys = ['name', 'place_id', 'url', 'rating', 'business_status', 'formatted_address']
-        self.business_data = []
-        self.reviews_data = []
-        self.sample_index = 0
+        self.query_dataset = []
+        self.business_dataset = []
+        self.reviews_dataset = []
 
-    def __call__(self, places_names: list = [], accumulate: bool = False):
-        # create names places names indexes
-        for place_name in places_names:
-            self.get_raw_data(place_name, accumulate=accumulate)
-            self.get_business_data(place_name)
+    def create_dataset(self, places_names: list, dataset_name: str = "dataset", export: bool = True):
+        self.create_query_table(places_names)
+        self.create_business_table()
+        self.create_reviews_table()
+        if export:
+            self.export_tables(dataset_name)
 
-    def get_raw_data(self, place_name: str = None, accumulate: bool = False):
+    def create_query_table(self, places_names):
+
+        # create query dataset
+        for index, place_name in enumerate(places_names):
+            # scrape data
+            scraped_data = getattr(self.gmaps, 'places')(place_name)
+
+            # update query dataset
+            self.query_dataset.append({'index': index, 'query': place_name, 'status': scraped_data['status'],
+                                       'amount_of_results': len(scraped_data['results']), 'date': datetime.now(),
+                                       'results': scraped_data['results']})
+
+    def create_business_table(self):
+        business_index = 0
+        for query_data in self.query_dataset:
+            for business_data in query_data['results']:
+                business_index += 1
+                business_data = getattr(self.gmaps, 'place')(business_data['place_id'])
+                self.business_dataset.append({'index': business_index,
+                                              'query_id': query_data['index'],
+                                              'name': business_data['result']['name'],
+                                              'place_id': business_data['result']['place_id'],
+                                              'query_status': business_data['status'],
+                                              'name_match': business_data['result']['name'].lower() in query_data[
+                                                  'query'].lower(),
+                                              'url': business_data['result']['url'],
+                                              'rating': business_data['result']['rating'],
+                                              'business_status': business_data['result']['business_status'],
+                                              'address': business_data['result']['formatted_address'],
+                                              'n_reviews': len(business_data['result']['reviews']),
+                                              'reviews': business_data['result']['reviews']})
+            del query_data['results']
+
+    def create_reviews_table(self):
         """
-        get raw data about the business from scraping
+        IMPORTANT - according to this documentation,
+        https://developers.google.com/maps/documentation/places/web-service/details#PlaceReview
+        the key 'time' in review represents "The time that the review was submitted, measured in the number of seconds
+         since since midnight, January 1, 1970 UTC."
         """
+        review_index = 0
+        for business_data in self.business_dataset:
+            for review in business_data['reviews']:
+                review_index += 1
+                self.reviews_dataset.append({'index': review_index,
+                                             'business_id': business_data['index'],
+                                             'author_name': review['author_name'],
+                                             'author_url': review['author_url'],
+                                             'language': review['language'],
+                                             'translated': review['translated'],
+                                             'rating': review['rating'],
+                                             'time': review['time'],  # amount of seconds since 01/01/1970 at midnight
+                                             'date': add_seconds(self.start_date, review['time']),
+                                             'text': review['text']})
+            del business_data['reviews']
 
-        # stage 1: get scraped data, and make that it is OK
-        scraped_data = self.gmaps.places(place_name)
-        if (scraped_data['status'] != "OK") | (len(scraped_data['results']) == 0):
-            warnings.warn(f"The business name '{place_name}' can not be extracted from google maps")
-            return
-
-        # if there is more than a single results, and the user does not wishes to accumulate the results, get only the
-        # first results
-        if (not accumulate) & (len(scraped_data['results']) > 1):
-            warnings.warn(f"The business name '{place_name} has {len(scraped_data['results'])} results."
-                          f" Since 'accumulate==False', using only the first results")
-            scraped_data['results'] = [scraped_data['results'][0]]
-
-        # iterate over all results
-        for result in scraped_data['results']:
-
-            # make sure that the scraped business name matches the input name
-            if result['name'].lower() not in place_name.lower():
-                warnings.warn(f"The required business name '{place_name}',"
-                              f" does not match the scraped business name '{result['name']}'")
-
-            # stage 2: get business full data using business's ID
-            place_data = self.gmaps.place(result['place_id'])
-
-            # make sure place data is valid
-            if place_data['status'] != 'OK':
-                warnings.warn(f"Something is wrong with extracting data from the place '{place_name}'")
-                continue
-
-            # append to raw data
-            self.raw_data.append({**{'name_key': place_name}, **place_data['result']})
-
-    def get_business_data(self, place_name: str = None):
-        """
-        get the business data as mentioned in the required keys
-        """
-
-        # iterate over all samples in raw data
-        for d in self.raw_data:
-            # continue only if the sample is related to current place name
-            if d['name_key'] == place_name:
-                # increase sample index by 1 (similar to 'primary key' in SQL)
-                self.sample_index += 1
-                # extract business 'meta' data
-                self.business_data.append({**{'business_key': self.sample_index, 'name_key': place_name},
-                                           **{k: d[k] for k in self.businesses_data_keys}})
-                # extract reviews data
-                self.reviews_data.extend([{**{'business_key': self.sample_index, 'name_key': place_name},
-                                           **r} for r in d['reviews']])
-
-    def export_data(self):
-        pd.DataFrame(self.business_data).to_csv('business_data.csv')
-        pd.DataFrame(self.reviews_data).to_csv('reviews_data.csv')
+    def export_tables(self, dateset_name):
+        if not os.path.isdir(dateset_name):
+            os.mkdir(dateset_name)
+        for table_name in ['query', 'business', 'reviews']:
+            pd.DataFrame(getattr(self, f'{table_name}_dataset')).to_csv(f'{dateset_name}/{table_name}.csv')
 
 
-def use_googlemaps_scraper():
-    places = ['Subway, New-York', "McDonald's, New-York", "KFC, New-York", "Wendy's, New-York"]
-    g_scraper = googlemaps_scraper()
-    g_scraper(places, accumulate=True)
-    g_scraper.export_data()
+def add_seconds(start_date, seconds_to_add):
+    """
+    given start date and amount of seconds, calculate the new date
+    """
+    return start_date + timedelta(seconds=seconds_to_add)
+
+
+def run_googlemaps_scraper():
+    """
+
+    This function runs the googlemaps_scraper class that creates a dataset with 3 tables.
+
+    User inputs:
+        1. businesses to query
+        2. dataset name
+
+    Outputs - 3 tables in csv format
+        1. query - information about the query processing
+        2. business - information about each business that was extracted from each query
+        3. reviews - information about each business's review
+
+    """
+    dataset_name = "new_york_fast_food"
+    places = ['Subway, New-York', "McDonald's, New-York", "KFC, New-York", "Wendy's, New-York", "Wenedies, Nu,York",
+              "BulBulAkaBulBul"]
+    g_scrape = googlemaps_scraper()
+    g_scrape.create_dataset(places, dataset_name, False)
+
+    #
+    reviews = pd.DataFrame(g_scrape.reviews_dataset)
+    agg_rating(reviews_df=reviews, frequency='Y')#, date_range=('01-01-2015',datetime.today()), min_review=2)
+
+
+def agg_rating(reviews_df: pd.DataFrame,
+               frequency: str = "M",
+               date_range: tuple = (googlemaps_scraper.start_date, datetime.today() + timedelta(days=1)),
+               min_review: int = 0):
+
+    # filter dates
+    reviews_df = reviews_df[(reviews_df['date']>date_range[0]) & (reviews_df['date']<date_range[1])]
+    if reviews_df.shape[0] == 0:
+        warnings.warn(f"There are no dates between {date_range[0]}-{date_range[1]}. Chose another range")
+
+    # assert frequency
+    if frequency.lower() not in ['y', 'm', 'd']:
+        raise ValueError("The frequency should be by year (Y) / month (M) / day (D)")
+
+    # get for each month - mean review, STD review, amount of reviews
+    ratings_agg_df = reviews_df.resample(rule=frequency, on='date').agg({'rating': ['mean', 'std', 'count']})
+
+    # get only values above minimal amount of reviews
+    ratings_agg_df = ratings_agg_df[ratings_agg_df['rating']['count'] >= min_review]
+
+    print(ratings_agg_df)
+
+    # TODO - fix bug: X-axis shows one year ahead (of it's 2023, it shows 2024)
+    
+    # plot
+    plt.plot(ratings_agg_df.index.to_list(), ratings_agg_df['rating']['mean'])
+    plt.scatter(ratings_agg_df.index.to_list(), ratings_agg_df['rating']['mean'])
+    plt.fill_between(ratings_agg_df.index.to_list(),
+                     ratings_agg_df['rating']['mean'] + ratings_agg_df['rating']['std'],
+                     ratings_agg_df['rating']['mean'] - ratings_agg_df['rating']['std'], alpha=0.4)
+    plt.show()
+
 
 
 if __name__ == "__main__":
-    use_googlemaps_scraper()
+    run_googlemaps_scraper()
+
+    """
+    TODO
+        * create data processing
+        * create graphics for a single business:
+            1. time-trend - all reviews, reviews without-text, reviews with text
+            2. percentage of reviews with / without text
+            3. percentage of reviews amount [0-1, 1-2, 2-3, 3-4, 4-5]
+            4. text analysis
+            5. reviewers similar to user analysis
+            6. bots analysis
+            
+        * create graphics for comparing businesses
+    """
